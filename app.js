@@ -1,6 +1,7 @@
 /* =====================================================================
  * 留言板 · Note Wall
  * app.js —— 逻辑全部在本地完成，数据存 localStorage
+ * v1.1.0：新增「回复指定留言」与「图片」
  * ===================================================================== */
 
 (function () {
@@ -16,6 +17,11 @@
 
   const PAGE = 8;
   const MAX_LEN = 500;
+  const MAX_REPLY = 300;
+  const MAX_IMAGES = 3;
+  const IMG_MAX_EDGE = 1280;
+  const IMG_TARGET_BYTES = 200 * 1024;
+  const DEFAULT_HINT = '说点什么吧，写下的内容只会保存在这台设备的浏览器里。';
 
   /* ------------------------------------------------------------ 工具 */
 
@@ -84,9 +90,57 @@
   function initial(name) {
     const s = String(name).trim();
     if (!s) return '匿';
-    // 取第一个「有意义」的字符（中文取首字，英文取首字母大写）
     const ch = Array.from(s)[0];
     return /[a-z]/.test(ch) ? ch.toUpperCase() : ch;
+  }
+
+  /** 压缩图片为 dataURL，控制体积以适配 localStorage */
+  function compressImage(file) {
+    return new Promise((resolve, reject) => {
+      if (!file || !/^image\//.test(file.type)) {
+        reject(new Error('不是图片文件'));
+        return;
+      }
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+
+      img.onload = () => {
+        const scale = Math.min(1, IMG_MAX_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
+        let w = Math.max(1, Math.round(img.naturalWidth * scale));
+        let h = Math.max(1, Math.round(img.naturalHeight * scale));
+
+        const canvas = document.createElement('canvas');
+        const ctx = canvas.getContext('2d');
+        let quality = 0.82;
+        let data = '';
+
+        for (let guard = 0; guard < 8; guard++) {
+          canvas.width = w;
+          canvas.height = h;
+          ctx.clearRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          data = canvas.toDataURL('image/webp', quality);
+          if (data.length * 0.75 <= IMG_TARGET_BYTES) break;
+          if (quality > 0.55) {
+            quality -= 0.12;
+          } else {
+            w = Math.max(1, Math.round(w * 0.8));
+            h = Math.max(1, Math.round(h * 0.8));
+            quality = 0.72;
+          }
+        }
+
+        URL.revokeObjectURL(url);
+        resolve(data);
+      };
+
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error('图片读取失败'));
+      };
+
+      img.src = url;
+    });
   }
 
   /* ------------------------------------------------------------ 状态 */
@@ -102,23 +156,40 @@
 
   let notes = loadNotes();
   let likedSet = new Set(read(KEY.liked, []));
-  let state = {
+
+  const state = {
     sort: 'new',
     query: '',
     visible: PAGE,
     justAdded: null,
+    openReply: new Set(),   // 展开了回复框的留言
+    expanded: new Set(),    // 展开了全部回复的留言
+    quote: new Map(),       // noteId -> replyId（引用回复）
+    drafts: new Map(),      // noteId -> 草稿文本
+    pending: [],            // 待发布的图片 dataURL
   };
 
   function loadNotes() {
     const saved = read(KEY.notes, null);
     if (!Array.isArray(saved)) {
-      // 首次访问：从一条空白留言墙开始
       write(KEY.notes, []);
       return [];
     }
-    // 迁移：清掉早期版本内置的示例留言（ownerId 为 seed）
-    const cleaned = saved.filter(isValidNote).filter((n) => n.ownerId !== 'seed');
-    if (cleaned.length !== saved.length) write(KEY.notes, cleaned);
+    // 迁移：清掉早期版本内置的示例留言；补齐 v1.1.0 新字段
+    let changed = false;
+    const cleaned = [];
+
+    for (const n of saved) {
+      if (!isValidNote(n)) { changed = true; continue; }
+      if (n.ownerId === 'seed') { changed = true; continue; }
+
+      if (!Array.isArray(n.images)) { n.images = []; changed = true; }
+      if (!Array.isArray(n.replies)) { n.replies = []; changed = true; }
+      n.replies = n.replies.filter((r) => r && typeof r.text === 'string');
+      cleaned.push(n);
+    }
+
+    if (changed) write(KEY.notes, cleaned);
     return cleaned;
   }
 
@@ -127,9 +198,7 @@
   }
 
   function save() {
-    if (!write(KEY.notes, notes)) {
-      toast('保存失败：浏览器存储空间可能已满', true);
-    }
+    return write(KEY.notes, notes);
   }
 
   /* ------------------------------------------------------------ DOM */
@@ -139,13 +208,16 @@
     nickname: $('#nickname'),
     content: $('#content'),
     count: $('#count'),
-    counter: null,
+    counter: $('#count').parentElement,
     hint: $('#hint'),
     statusDot: $('#status-dot'),
     statusText: $('#status-text'),
     previewAvatar: $('#preview-avatar'),
     clearBtn: $('#clear-btn'),
-    submitBtn: $('#submit-btn'),
+    pickImg: $('#pick-img'),
+    fileInput: $('#file-input'),
+    imgStrip: $('#img-strip'),
+    imgHint: $('#img-hint'),
     search: $('#search'),
     themeBtn: $('#theme-btn'),
     list: $('#list'),
@@ -155,10 +227,11 @@
     moreBtn: $('#more-btn'),
     toast: $('#toast'),
     exportBtn: $('#export-btn'),
+    lightbox: $('#lightbox'),
+    lightboxImg: $('#lightbox-img'),
+    lightboxClose: $('#lightbox-close'),
     tabs: Array.prototype.slice.call(document.querySelectorAll('.tab')),
   };
-
-  el.counter = el.count.parentElement;
 
   /* ------------------------------------------------------------ 主题 */
 
@@ -170,8 +243,7 @@
   }
 
   el.themeBtn.addEventListener('click', () => {
-    const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-    applyTheme(next);
+    applyTheme(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light');
   });
 
   /* ------------------------------------------------------------ 渲染 */
@@ -186,7 +258,6 @@
     el.previewAvatar.textContent = initial(name);
     el.previewAvatar.setAttribute('style', avatarStyle(name));
     el.previewAvatar.classList.remove('pop');
-    // 强制重排以重启动画
     void el.previewAvatar.offsetWidth;
     el.previewAvatar.classList.add('pop');
   }
@@ -203,11 +274,15 @@
       );
     }
     if (state.sort === 'hot') {
-      arr.sort((a, b) => (b.likes || 0) - (a.likes || 0) || b.at - a.at);
+      arr.sort((a, b) => heat(b) - heat(a) || b.at - a.at);
     } else {
       arr.sort((a, b) => b.at - a.at);
     }
     return arr;
+  }
+
+  function heat(n) {
+    return (n.likes || 0) * 3 + (n.replies ? n.replies.length : 0) * 4 + Math.log10(1 + (n.images || []).length * 5);
   }
 
   function highlighted(text, q) {
@@ -217,14 +292,132 @@
     return safe.replace(re, '<mark>$1</mark>');
   }
 
+  const ICON = {
+    heart: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.3 5.7a5.1 5.1 0 0 0-7.2 0L12 6.8l-1.1-1.1a5.1 5.1 0 1 0-7.2 7.2L12 21l8.3-8.1a5.1 5.1 0 0 0 0-7.2z"/></svg>',
+    reply: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9.5 9.5 0 0 1-2.9-.5L4 21l1.5-4.4A8.2 8.2 0 0 1 3 11.6C3 7 7 3.4 12 3.4s9 3.6 9 8.1z"/></svg>',
+    copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 5.5A2.5 2.5 0 0 0 12.5 3h-6A3.5 3.5 0 0 0 3 6.5v6A2.5 2.5 0 0 0 5.5 15"/></svg>',
+    trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/></svg>',
+    close: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg>',
+  };
+
+  /* ------------------------------------------------------------ 回复渲染 */
+
+  function replyTemplate(note, r, q) {
+    const mine = r.ownerId === ownerId;
+    const canDelete = mine || note.ownerId === ownerId;
+    const name = r.name || '匿名';
+
+    return (
+      '<div class="reply" data-rid="' + r.id + '">' +
+        '<div class="avatar avatar-sm" style="' + avatarStyle(name) + '" aria-hidden="true">' +
+          escapeHtml(initial(name)) +
+        '</div>' +
+        '<div class="reply-main">' +
+          '<div class="reply-head">' +
+            '<span class="reply-name">' + highlighted(name, q) + '</span>' +
+            (mine ? '<span class="tag-mine">我</span>' : '') +
+            '<span class="reply-time" title="' + escapeHtml(new Date(r.at).toLocaleString()) + '">' +
+              escapeHtml(timeAgo(r.at)) +
+            '</span>' +
+          '</div>' +
+          (r.quote
+            ? '<div class="quote" title="' + escapeHtml(r.quote.text) + '">' +
+                '<span class="quote-who">@' + escapeHtml(r.quote.name) + '</span>' +
+                '<span class="quote-text">' + escapeHtml(r.quote.text) + '</span>' +
+              '</div>'
+            : '') +
+          '<div class="reply-text">' + highlighted(r.text, q) + '</div>' +
+          '<div class="reply-acts">' +
+            '<button class="act act-xs" type="button" data-act="reply-to" data-rid="' + r.id + '">回复</button>' +
+            (canDelete
+              ? '<button class="act act-xs del" type="button" data-act="reply-del" data-rid="' + r.id + '">删除</button>'
+              : '') +
+          '</div>' +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function replyBlock(note, q) {
+    const replies = note.replies || [];
+    const open = state.openReply.has(note.id);
+    const expanded = state.expanded.has(note.id);
+    const shown = expanded ? replies : replies.slice(-2);
+    const hiddenCount = replies.length - shown.length;
+
+    const quoteId = state.quote.get(note.id);
+    const quoteTarget = quoteId ? replies.find((r) => r.id === quoteId) : null;
+
+    let html = '<section class="replies">';
+
+    if (replies.length) {
+      html +=
+        (hiddenCount > 0
+          ? '<button class="more-replies" type="button" data-act="expand">展开其余 ' + hiddenCount + ' 条回复</button>'
+          : '') +
+        '<div class="reply-list">' +
+          shown.map((r) => replyTemplate(note, r, q)).join('') +
+        '</div>';
+    }
+
+    if (open) {
+      html +=
+        '<form class="reply-form" data-note="' + note.id + '">' +
+          (quoteTarget
+            ? '<div class="quote-chip">' +
+                '<span>回复 <b>@' + escapeHtml(quoteTarget.name || '匿名') + '</b>：' +
+                  escapeHtml(quoteTarget.text.slice(0, 40)) + '</span>' +
+                '<button type="button" class="chip-x" data-act="quote-cancel" aria-label="取消引用">' +
+                  ICON.close + '</button>' +
+              '</div>'
+            : '') +
+          '<textarea class="reply-input" maxlength="' + MAX_REPLY + '" rows="2" ' +
+            'placeholder="回复 ' + escapeHtml(note.name || '匿名') + '…">' +
+            escapeHtml(state.drafts.get(note.id) || '') +
+          '</textarea>' +
+          '<div class="reply-form-foot">' +
+            '<span class="reply-counter" data-for="' + note.id + '">' +
+              (state.drafts.get(note.id) || '').length + ' / ' + MAX_REPLY +
+            '</span>' +
+            '<button type="button" class="btn btn-ghost btn-sm" data-act="reply-cancel">取消</button>' +
+            '<button type="submit" class="btn btn-primary btn-sm">发送</button>' +
+          '</div>' +
+        '</form>';
+    } else {
+      html +=
+        '<button class="reply-trigger" type="button" data-act="open-reply">' +
+          '<span class="trigger-avatar" style="' + avatarStyle(currentName()) + '">' +
+            escapeHtml(initial(currentName())) +
+          '</span>' +
+          '<span>写下你的回复…</span>' +
+        '</button>';
+    }
+
+    html += '</section>';
+    return html;
+  }
+
+  /* ------------------------------------------------------------ 留言渲染 */
+
   function noteTemplate(note, q, animate) {
     const liked = likedSet.has(note.id);
     const mine = note.ownerId === ownerId;
     const name = note.name || '匿名';
+    const images = note.images || [];
 
     const article = document.createElement('article');
     article.className = 'note' + (mine ? ' mine' : '') + (animate ? ' enter' : '');
     article.dataset.id = note.id;
+
+    const imgsHtml = images.length
+      ? '<div class="note-imgs cols-' + Math.min(images.length, 3) + '">' +
+          images.map((src, i) =>
+            '<button type="button" class="img-cell" data-act="img" aria-label="查看图片 ' + (i + 1) + '">' +
+              '<img src="' + src + '" alt="附图 ' + (i + 1) + '" loading="lazy">' +
+            '</button>'
+          ).join('') +
+        '</div>'
+      : '';
 
     article.innerHTML =
       '<div class="note-head">' +
@@ -241,37 +434,30 @@
           '</div>' +
         '</div>' +
       '</div>' +
-      '<p class="note-body">' + highlighted(note.text, q) + '</p>' +
+      (note.text
+        ? '<p class="note-body">' + highlighted(note.text, q) + '</p>'
+        : '') +
+      imgsHtml +
       '<div class="note-foot">' +
         '<button class="act like' + (liked ? ' on' : '') + '" type="button" data-act="like" ' +
           'aria-pressed="' + liked + '" aria-label="点赞">' +
-          heartSvg() +
-          '<span class="like-n">' + (note.likes || 0) + '</span>' +
+          ICON.heart + '<span class="like-n">' + (note.likes || 0) + '</span>' +
+        '</button>' +
+        '<button class="act" type="button" data-act="open-reply" aria-label="回复这条留言">' +
+          ICON.reply + '<span>回复' + (note.replies.length ? ' ' + note.replies.length : '') + '</span>' +
         '</button>' +
         '<button class="act" type="button" data-act="copy" aria-label="复制这条留言">' +
-          copySvg() + '<span>复制</span>' +
+          ICON.copy + '<span>复制</span>' +
         '</button>' +
         (mine
           ? '<span class="act-spacer"></span>' +
             '<button class="act del" type="button" data-act="del" aria-label="删除这条留言">' +
-            trashSvg() + '<span>删除</span></button>'
+            ICON.trash + '<span>删除</span></button>'
           : '') +
-      '</div>';
+      '</div>' +
+      replyBlock(note, q);
 
     return article;
-  }
-
-  function heartSvg() {
-    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
-      'stroke-linecap="round" stroke-linejoin="round"><path d="M20.3 5.7a5.1 5.1 0 0 0-7.2 0L12 6.8l-1.1-1.1a5.1 5.1 0 1 0-7.2 7.2L12 21l8.3-8.1a5.1 5.1 0 0 0 0-7.2z"/></svg>';
-  }
-  function copySvg() {
-    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
-      'stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2.5"/><path d="M15 5.5A2.5 2.5 0 0 0 12.5 3h-6A3.5 3.5 0 0 0 3 6.5v6A2.5 2.5 0 0 0 5.5 15"/></svg>';
-  }
-  function trashSvg() {
-    return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" ' +
-      'stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/></svg>';
   }
 
   function render() {
@@ -286,7 +472,6 @@
     el.list.appendChild(frag);
     state.justAdded = null;
 
-    // 空状态
     const isEmpty = list.length === 0;
     el.empty.hidden = !isEmpty;
     el.list.hidden = isEmpty;
@@ -296,20 +481,50 @@
         : '还没有留言，成为第一个写下的人吧。';
     }
 
-    // 计数
     const total = notes.length;
-    if (state.query.trim()) {
-      el.countLabel.textContent = '找到 ' + list.length + ' 条 / 共 ' + total + ' 条';
-    } else {
-      el.countLabel.textContent = '共 ' + total + ' 条留言';
-    }
+    el.countLabel.textContent = state.query.trim()
+      ? '找到 ' + list.length + ' 条 / 共 ' + total + ' 条'
+      : '共 ' + total + ' 条留言';
 
-    // 加载更多
     el.moreBtn.hidden = list.length <= state.visible;
     el.moreBtn.textContent = '加载更多（还有 ' + Math.max(0, list.length - state.visible) + ' 条）';
+
+    // 回复框自动聚焦
+    for (const id of state.openReply) {
+      const ta = el.list.querySelector('.reply-input[data-note="' + id + '"]') ||
+                 el.list.querySelector('.reply-form[data-note="' + id + '"] .reply-input');
+      if (ta) {
+        const val = ta.value;
+        ta.focus();
+        ta.setSelectionRange(val.length, val.length);
+        break;
+      }
+    }
   }
 
-  /* ------------------------------------------------------------ 交互：列表 */
+  /* ------------------------------------------------------------ 图片查看 */
+
+  function openLightbox(src) {
+    el.lightboxImg.src = src;
+    el.lightbox.hidden = false;
+    document.body.style.overflow = 'hidden';
+  }
+
+  function closeLightbox() {
+    el.lightbox.hidden = true;
+    el.lightboxImg.removeAttribute('src');
+    document.body.style.overflow = '';
+  }
+
+  el.lightboxClose.addEventListener('click', closeLightbox);
+  el.lightbox.addEventListener('click', (e) => {
+    if (e.target === el.lightbox) closeLightbox();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !el.lightbox.hidden) closeLightbox();
+  });
+
+  /* ------------------------------------------------------------ 列表交互 */
 
   el.list.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-act]');
@@ -319,22 +534,29 @@
     const id = card.dataset.id;
     const note = notes.find((n) => n.id === id);
     if (!note) return;
-
     const act = btn.dataset.act;
 
+    /* 图片放大 */
+    if (act === 'img') {
+      const img = btn.querySelector('img');
+      if (img) openLightbox(img.src);
+      return;
+    }
+
+    /* 点赞 */
     if (act === 'like') {
       const on = !likedSet.has(id);
       if (on) likedSet.add(id); else likedSet.delete(id);
       note.likes = Math.max(0, (note.likes || 0) + (on ? 1 : -1));
       write(KEY.liked, Array.from(likedSet));
       save();
-
       btn.classList.toggle('on', on);
       btn.setAttribute('aria-pressed', String(on));
       btn.querySelector('.like-n').textContent = note.likes;
       return;
     }
 
+    /* 复制 */
     if (act === 'copy') {
       const text = (note.name || '匿名') + '：' + note.text;
       copyText(text).then(
@@ -344,8 +566,8 @@
       return;
     }
 
+    /* 删除留言（两段式确认） */
     if (act === 'del') {
-      // 两次点击确认，避免误删
       if (btn.dataset.confirm !== '1') {
         btn.dataset.confirm = '1';
         btn.classList.add('confirming');
@@ -359,18 +581,162 @@
         }, 3000);
         return;
       }
-
       clearTimeout(btn._resetTimer);
       card.classList.add('leaving');
       setTimeout(() => {
         notes = notes.filter((n) => n.id !== id);
         likedSet.delete(id);
         write(KEY.liked, Array.from(likedSet));
+        state.openReply.delete(id);
+        state.expanded.delete(id);
+        state.quote.delete(id);
+        state.drafts.delete(id);
         save();
         render();
         toast('已删除');
       }, 200);
+      return;
     }
+
+    /* 展开全部回复 */
+    if (act === 'expand') {
+      state.expanded.add(id);
+      render();
+      return;
+    }
+
+    /* 打开回复框 */
+    if (act === 'open-reply') {
+      state.openReply.add(id);
+      render();
+      return;
+    }
+
+    /* 引用某条回复 */
+    if (act === 'reply-to') {
+      state.openReply.add(id);
+      state.quote.set(id, btn.dataset.rid);
+      render();
+      return;
+    }
+
+    /* 取消引用 */
+    if (act === 'quote-cancel') {
+      state.quote.delete(id);
+      render();
+      return;
+    }
+
+    /* 取消回复 */
+    if (act === 'reply-cancel') {
+      state.openReply.delete(id);
+      render();
+      return;
+    }
+
+    /* 删除回复（两段式确认） */
+    if (act === 'reply-del') {
+      if (btn.dataset.confirm !== '1') {
+        btn.dataset.confirm = '1';
+        btn.textContent = '确认删除？';
+        btn.classList.add('confirming');
+        clearTimeout(btn._resetTimer);
+        btn._resetTimer = setTimeout(() => {
+          if (!btn.isConnected) return;
+          delete btn.dataset.confirm;
+          btn.classList.remove('confirming');
+          btn.textContent = '删除';
+        }, 3000);
+        return;
+      }
+      const rid = btn.dataset.rid;
+      clearTimeout(btn._resetTimer);
+      note.replies = note.replies.filter((r) => r.id !== rid);
+      if (state.quote.get(id) === rid) state.quote.delete(id);
+      save();
+      render();
+      toast('回复已删除');
+    }
+  });
+
+  /* 回复框输入：保存草稿 + 字数 */
+  el.list.addEventListener('input', (e) => {
+    const ta = e.target.closest('.reply-input');
+    if (!ta) return;
+    const form = ta.closest('.reply-form');
+    const noteId = form.dataset.note;
+    state.drafts.set(noteId, ta.value);
+    const counter = form.querySelector('.reply-counter');
+    if (counter) counter.textContent = ta.value.length + ' / ' + MAX_REPLY;
+  });
+
+  /* 回复框提交 + Ctrl+Enter */
+  el.list.addEventListener('keydown', (e) => {
+    const ta = e.target.closest('.reply-input');
+    if (!ta) return;
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      ta.closest('form').requestSubmit();
+    }
+    if (e.key === 'Escape') {
+      const form = ta.closest('.reply-form');
+      state.openReply.delete(form.dataset.note);
+      render();
+    }
+  });
+
+  el.list.addEventListener('submit', (e) => {
+    const form = e.target.closest('.reply-form');
+    if (!form) return;
+    e.preventDefault();
+
+    const noteId = form.dataset.note;
+    const note = notes.find((n) => n.id === noteId);
+    if (!note) return;
+
+    const ta = form.querySelector('.reply-input');
+    const text = (ta.value || '').trim();
+    if (!text) {
+      toast('回复内容不能为空', true);
+      ta.focus();
+      return;
+    }
+    if (text.length > MAX_REPLY) {
+      toast('回复不能超过 ' + MAX_REPLY + ' 字', true);
+      return;
+    }
+
+    const quoteId = state.quote.get(noteId);
+    let quote = null;
+    if (quoteId) {
+      const target = (note.replies || []).find((r) => r.id === quoteId);
+      if (target) {
+        quote = { name: target.name || '匿名', text: target.text.slice(0, 60) };
+      }
+    }
+
+    const reply = {
+      id: uid(),
+      name: currentName().slice(0, 16),
+      text: text,
+      at: Date.now(),
+      ownerId: ownerId,
+      quote: quote,
+    };
+
+    note.replies.push(reply);
+    if (!save()) {
+      note.replies.pop();
+      toast('保存失败：浏览器存储空间不足', true);
+      return;
+    }
+
+    state.drafts.delete(noteId);
+    state.quote.delete(noteId);
+    state.openReply.delete(noteId);
+    state.expanded.add(noteId);
+    render();
+    toast('回复已发布');
   });
 
   function copyText(text) {
@@ -399,7 +765,7 @@
     render();
   });
 
-  /* ------------------------------------------------------------ 交互：排序 / 搜索 */
+  /* ------------------------------------------------------------ 排序 / 搜索 */
 
   el.tabs.forEach((tab) => {
     tab.addEventListener('click', () => {
@@ -439,7 +805,96 @@
     }
   });
 
-  /* ------------------------------------------------------------ 交互：发布 */
+  /* ------------------------------------------------------------ 图片选择 */
+
+  function renderStrip() {
+    const n = state.pending.length;
+    el.imgStrip.hidden = n === 0;
+
+    el.imgStrip.innerHTML = state.pending.map((src, i) =>
+      '<div class="strip-item">' +
+        '<img src="' + src + '" alt="待发布图片 ' + (i + 1) + '">' +
+        '<button type="button" class="strip-x" data-i="' + i + '" aria-label="移除图片">' + ICON.close + '</button>' +
+      '</div>'
+    ).join('');
+
+    el.imgHint.textContent = n >= MAX_IMAGES
+      ? '已达上限（' + MAX_IMAGES + ' 张）'
+      : '还可添加 ' + (MAX_IMAGES - n) + ' 张';
+    el.imgHint.classList.toggle('warn', n >= MAX_IMAGES);
+    updateStatus();
+  }
+
+  el.imgStrip.addEventListener('click', (e) => {
+    const btn = e.target.closest('.strip-x');
+    if (!btn) return;
+    state.pending.splice(Number(btn.dataset.i), 1);
+    renderStrip();
+  });
+
+  async function addFiles(fileList) {
+    const files = Array.prototype.slice.call(fileList || []);
+    const imgs = files.filter((f) => /^image\//.test(f.type));
+    if (!imgs.length) {
+      toast('请选择图片文件', true);
+      return;
+    }
+
+    for (const file of imgs) {
+      if (state.pending.length >= MAX_IMAGES) {
+        toast('最多只能添加 ' + MAX_IMAGES + ' 张图片', true);
+        break;
+      }
+      try {
+        const data = await compressImage(file);
+        state.pending.push(data);
+        renderStrip();
+      } catch (err) {
+        toast('图片处理失败：' + err.message, true);
+      }
+    }
+  }
+
+  el.pickImg.addEventListener('click', () => el.fileInput.click());
+  el.fileInput.addEventListener('change', () => {
+    addFiles(el.fileInput.files);
+    el.fileInput.value = '';
+  });
+
+  /* 粘贴图片 */
+  el.content.addEventListener('paste', (e) => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === 'file' && /^image\//.test(it.type)) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) {
+      e.preventDefault();
+      addFiles(files);
+    }
+  });
+
+  /* 拖拽图片到输入框 */
+  el.content.addEventListener('dragover', (e) => {
+    if (e.dataTransfer && Array.prototype.some.call(e.dataTransfer.types, (t) => t === 'Files')) {
+      e.preventDefault();
+      el.content.classList.add('dragging');
+    }
+  });
+  el.content.addEventListener('dragleave', () => el.content.classList.remove('dragging'));
+  el.content.addEventListener('drop', (e) => {
+    el.content.classList.remove('dragging');
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      e.preventDefault();
+      addFiles(e.dataTransfer.files);
+    }
+  });
+
+  /* ------------------------------------------------------------ 发布留言 */
 
   function updateCounter() {
     const len = el.content.value.length;
@@ -448,7 +903,9 @@
   }
 
   function updateStatus() {
-    const has = el.content.value.trim().length > 0 || el.nickname.value.trim().length > 0;
+    const has = el.content.value.trim().length > 0 ||
+      el.nickname.value.trim().length > 0 ||
+      state.pending.length > 0;
     el.statusDot.className = 'dot' + (has ? ' dirty' : '');
     el.statusText.textContent = has ? '编辑中…' : '未发布';
   }
@@ -457,8 +914,6 @@
     el.hint.textContent = msg;
     el.hint.classList.toggle('err', !!isError);
   }
-
-  const DEFAULT_HINT = '说点什么吧，写下的内容只会保存在这台设备的浏览器里。';
 
   el.nickname.addEventListener('input', () => {
     refreshAvatar();
@@ -481,8 +936,9 @@
 
   el.clearBtn.addEventListener('click', () => {
     el.content.value = '';
+    state.pending = [];
+    renderStrip();
     updateCounter();
-    updateStatus();
     setHint(DEFAULT_HINT, false);
     el.content.focus();
   });
@@ -491,8 +947,8 @@
     e.preventDefault();
 
     const text = el.content.value.trim();
-    if (!text) {
-      setHint('留言内容不能为空。', true);
+    if (!text && state.pending.length === 0) {
+      setHint('留言内容不能为空，写点字或加一张图片吧。', true);
       el.content.focus();
       return;
     }
@@ -508,19 +964,27 @@
       at: Date.now(),
       likes: 0,
       ownerId: ownerId,
+      images: state.pending.slice(),
+      replies: [],
     };
 
     notes.unshift(note);
-    save();
+    if (!save()) {
+      notes.shift();
+      setHint('保存失败：浏览器存储空间不足，少放几张图片试试。', true);
+      toast('保存失败：存储空间不足', true);
+      return;
+    }
 
     el.content.value = '';
+    state.pending = [];
+    renderStrip();
     updateCounter();
     refreshAvatar();
 
     state.justAdded = note.id;
     state.visible = Math.max(state.visible, PAGE);
 
-    // 发布后回到「最新」排序，保证新留言可见
     if (state.sort !== 'new') {
       state.sort = 'new';
       el.tabs.forEach((t) => {
@@ -576,24 +1040,28 @@
   /* ------------------------------------------------------------ 初始化 */
 
   function init() {
-    // 昵称回填
     const savedNick = read(KEY.nick, '');
     if (typeof savedNick === 'string' && savedNick) el.nickname.value = savedNick.slice(0, 16);
 
     refreshAvatar();
     updateCounter();
     updateStatus();
+    renderStrip();
     render();
     applyTheme(document.documentElement.dataset.theme || 'dark');
 
-    // 每 60 秒刷新相对时间
     setInterval(() => {
-      const cards = el.list.querySelectorAll('.note');
-      cards.forEach((card) => {
+      el.list.querySelectorAll('.note').forEach((card) => {
         const note = notes.find((n) => n.id === card.dataset.id);
         if (!note) return;
         const t = card.querySelector('.note-time');
         if (t) t.textContent = timeAgo(note.at);
+        card.querySelectorAll('.reply').forEach((r) => {
+          const rep = (note.replies || []).find((x) => x.id === r.dataset.rid);
+          if (!rep) return;
+          const rt = r.querySelector('.reply-time');
+          if (rt) rt.textContent = timeAgo(rep.at);
+        });
       });
     }, 60000);
   }
