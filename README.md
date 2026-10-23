@@ -77,7 +77,7 @@ npx serve .
 - **改配色**：`style.css` 顶部的 CSS 变量，`--accent` 是主色。
 - **改字数上限**：`app.js` 里的 `MAX_LEN`，同步改 `index.html` 中 `textarea` 的 `maxlength`。
 - **改每页条数**：`app.js` 里的 `PAGE`。
-- **改初始示例留言**：`app.js` 的 `seedNotes()`；想清空所有数据，在控制台执行 `localStorage.clear()` 后刷新。
+- **预置留言**：默认从空白墙开始；想预置内容，改 `app.js` 里 `loadNotes()` 的首次分支，返回一个数组即可。想清空所有数据，在控制台执行 `localStorage.clear()` 后刷新。
 
 ## License
 

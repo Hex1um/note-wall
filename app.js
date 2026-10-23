@@ -111,10 +111,15 @@
 
   function loadNotes() {
     const saved = read(KEY.notes, null);
-    if (Array.isArray(saved)) return saved.filter(isValidNote);
-    const seeded = seedNotes();
-    write(KEY.notes, seeded);
-    return seeded;
+    if (!Array.isArray(saved)) {
+      // 首次访问：从一条空白留言墙开始
+      write(KEY.notes, []);
+      return [];
+    }
+    // 迁移：清掉早期版本内置的示例留言（ownerId 为 seed）
+    const cleaned = saved.filter(isValidNote).filter((n) => n.ownerId !== 'seed');
+    if (cleaned.length !== saved.length) write(KEY.notes, cleaned);
+    return cleaned;
   }
 
   function isValidNote(n) {
@@ -125,30 +130,6 @@
     if (!write(KEY.notes, notes)) {
       toast('保存失败：浏览器存储空间可能已满', true);
     }
-  }
-
-  function seedNotes() {
-    const now = Date.now();
-    const min = 60 * 1000;
-    const hour = 60 * min;
-    return [
-      {
-        id: 'seed-2',
-        name: '阿柴',
-        text: '第一次用这个留言板，界面挺舒服的。\n希望以后能加上回复功能。',
-        at: now - 26 * min,
-        likes: 3,
-        ownerId: 'seed',
-      },
-      {
-        id: 'seed-1',
-        name: '匿名',
-        text: '路过，留个脚印。',
-        at: now - 3 * hour,
-        likes: 1,
-        ownerId: 'seed',
-      },
-    ];
   }
 
   /* ------------------------------------------------------------ DOM */
